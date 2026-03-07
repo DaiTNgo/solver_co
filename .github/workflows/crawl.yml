@@ -7,12 +7,28 @@ on:
         description: 'Number of parallel instances (1-10)'
         required: false
         default: '5'
+      concurrency:
+        description: 'Workers per instance (default: CPU count)'
+        required: false
+        default: ''
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          N=${{ inputs.total_instances }}
+          ARRAY=$(python3 -c "import json; print(json.dumps(list(range($N))))")
+          echo "matrix=$ARRAY" >> $GITHUB_OUTPUT
+
   crawl:
+    needs: setup
     strategy:
       matrix:
-        offset: [0, 1, 2, 3, 4]
+        offset: ${{ fromJSON(needs.setup.outputs.matrix) }}
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
@@ -32,11 +48,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Crawl (instance ${{ matrix.offset }} of 5)
+      - name: Crawl (instance ${{ matrix.offset }} of ${{ inputs.total_instances }})
         run: |
           ./target/release/crawl \
             --offset ${{ matrix.offset }} \
-            --total-instances 5 \
+            --total-instances ${{ inputs.total_instances }} \
+            ${{ inputs.concurrency != '' && format('--concurrency {0}', inputs.concurrency) || '' }} \
             --output output
 
       - name: Upload output artifact
