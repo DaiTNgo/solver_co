@@ -79,6 +79,21 @@ struct SubmitPayload<'a> {
     nonce: &'a str,
 }
 
+#[derive(Deserialize)]
+struct SubmitResponse {
+    status: Option<String>,
+    job_id: Option<String>,
+    result: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct JobPollResponse {
+    status: String,
+    result: Option<Value>,
+    error: Option<String>,
+    progress: Option<f64>,
+}
+
 // ─── PoW solver (CPU-bound, call via spawn_blocking) ─────────────────
 
 fn solve_pow(challenge: String, difficulty: u32) -> String {
@@ -99,6 +114,58 @@ fn solve_pow(challenge: String, difficulty: u32) -> String {
             return nonce.to_string();
         }
         nonce += 1;
+    }
+}
+
+// ─── Job polling ────────────────────────────────────────────────────
+
+async fn poll_job(client: &Client, job_id: &str) -> Result<Value> {
+    let started = Instant::now();
+    let timeout = Duration::from_secs(600);
+    let stall_limit = Duration::from_secs(60);
+    let mut last_progress: Option<f64> = None;
+    let mut last_progress_change = Instant::now();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        if started.elapsed() > timeout {
+            anyhow::bail!("analysis timed out (10 minutes)");
+        }
+
+        let resp = client
+            .get(format!("{BASE_URL}/api/analysis/{job_id}"))
+            .send()
+            .await
+            .context("poll job")?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.context("poll job body")?;
+        if !status.is_success() {
+            anyhow::bail!("poll HTTP {status}: {}", String::from_utf8_lossy(&bytes));
+        }
+
+        let poll: JobPollResponse =
+            serde_json::from_slice(&bytes).context("parse poll response")?;
+
+        match poll.status.as_str() {
+            "done" => {
+                return poll
+                    .result
+                    .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+                    .ok_or_else(|| anyhow::anyhow!("job done but result is empty"));
+            }
+            "error" => {
+                anyhow::bail!("job error: {}", poll.error.unwrap_or_default());
+            }
+            _ => {}
+        }
+
+        if poll.progress != last_progress {
+            last_progress = poll.progress;
+            last_progress_change = Instant::now();
+        } else if last_progress_change.elapsed() > stall_limit {
+            anyhow::bail!("analysis stalled (no progress for 60s)");
+        }
     }
 }
 
@@ -163,18 +230,36 @@ async fn process_game(
         .await
         .context("submit solution")?;
     let status = resp.status();
-    let response = resp.bytes().await.context("read response")?;
+    let bytes = resp.bytes().await.context("read submit response")?;
     if !status.is_success() {
-        anyhow::bail!("submit HTTP {status}: {}", String::from_utf8_lossy(&response));
+        anyhow::bail!("submit HTTP {status}: {}", String::from_utf8_lossy(&bytes));
+    }
+    let submit: SubmitResponse =
+        serde_json::from_slice(&bytes).context("parse submit response")?;
+
+    // Step 4: resolve result — immediate or via job polling
+    let result = if submit.status.as_deref() == Some("done") {
+        submit
+            .result
+            .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            .ok_or_else(|| anyhow::anyhow!("submit done but result is empty"))?
+    } else if let Some(job_id) = submit.job_id {
+        poll_job(&client, &job_id).await?
+    } else {
+        anyhow::bail!(
+            "unexpected submit response: {}",
+            String::from_utf8_lossy(&bytes)
+        );
     };
 
-    // Save output
+    // Save result array
     if let Some(parent) = output_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .context("create output dir")?;
     }
-    tokio::fs::write(&output_path, &response)
+    let out_bytes = serde_json::to_vec_pretty(&result).context("serialize result")?;
+    tokio::fs::write(&output_path, &out_bytes)
         .await
         .context("write output")?;
 
