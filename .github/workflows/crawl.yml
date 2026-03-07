@@ -1,0 +1,67 @@
+name: Crawl vuaco.app
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_instances:
+        description: 'Number of parallel instances (1-10)'
+        required: false
+        default: '5'
+
+jobs:
+  crawl:
+    strategy:
+      matrix:
+        offset: [0, 1, 2, 3, 4]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Crawl (instance ${{ matrix.offset }} of 5)
+        run: |
+          ./target/release/crawl \
+            --offset ${{ matrix.offset }} \
+            --total-instances 5 \
+            --output output
+
+      - name: Upload output artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-${{ matrix.offset }}
+          path: output/
+          if-no-files-found: warn
+
+  merge:
+    needs: crawl
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all output artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: output-*
+          merge-multiple: true
+          path: output/
+
+      - name: Upload merged output
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-merged
+          path: output/
+          retention-days: 30
