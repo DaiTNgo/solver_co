@@ -119,7 +119,7 @@ fn solve_pow(challenge: String, difficulty: u32) -> String {
 
 // ─── Job polling ────────────────────────────────────────────────────
 
-async fn poll_job(client: &Client, job_id: &str) -> Result<Value> {
+async fn poll_job(client: &Client, job_id: &str) -> Result<Option<Value>> {
     let started = Instant::now();
     let timeout = Duration::from_secs(600);
     let stall_limit = Duration::from_secs(60);
@@ -149,10 +149,9 @@ async fn poll_job(client: &Client, job_id: &str) -> Result<Value> {
 
         match poll.status.as_str() {
             "done" => {
-                return poll
+                return Ok(poll
                     .result
-                    .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-                    .ok_or_else(|| anyhow::anyhow!("job done but result is empty"));
+                    .filter(|v| v.as_array().is_some_and(|a| !a.is_empty())));
             }
             "error" => {
                 anyhow::bail!("job error: {}", poll.error.unwrap_or_default());
@@ -242,7 +241,6 @@ async fn process_game(
         submit
             .result
             .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-            .ok_or_else(|| anyhow::anyhow!("submit done but result is empty"))?
     } else if let Some(job_id) = submit.job_id {
         poll_job(&client, &job_id).await?
     } else {
@@ -252,7 +250,11 @@ async fn process_game(
         );
     };
 
-    // Save result array
+    // Only save when there is actual analysis data
+    let Some(result) = result else {
+        return Ok(());
+    };
+
     if let Some(parent) = output_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
