@@ -64,6 +64,10 @@ struct Args {
     #[arg(long)]
     chunk_size: Option<usize>,
 
+    /// CSV path for exporting challenge solve metrics (default: <output>/_metrics/challenge_times.csv)
+    #[arg(long)]
+    challenge_metrics_csv: Option<PathBuf>,
+
     /// Instance offset for sharding (0-based)
     #[arg(long, default_value_t = 0)]
     offset: usize,
@@ -164,6 +168,63 @@ fn solve_pow(challenge: String, difficulty: u32) -> String {
         }
         nonce += 1;
     }
+}
+
+async fn init_challenge_metrics_writer(path: &Path) -> Result<Arc<Mutex<tokio::fs::File>>> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("create metrics dir")?;
+    }
+
+    let needs_header = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    };
+
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .with_context(|| format!("open metrics file: {}", path.display()))?;
+
+    let writer = Arc::new(Mutex::new(file));
+    if needs_header {
+        use tokio::io::AsyncWriteExt;
+        let mut locked = writer.lock().await;
+        locked
+            .write_all(b"unix_ms,game_id,difficulty,pow_ms,nonce\n")
+            .await
+            .context("write metrics header")?;
+        locked.flush().await.context("flush metrics header")?;
+    }
+
+    Ok(writer)
+}
+
+async fn append_challenge_metric(
+    writer: &Arc<Mutex<tokio::fs::File>>,
+    game_id: &str,
+    difficulty: u32,
+    pow_ms: u128,
+    nonce: &str,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!("{unix_ms},{game_id},{difficulty},{pow_ms},{nonce}\n");
+
+    let mut locked = writer.lock().await;
+    locked
+        .write_all(line.as_bytes())
+        .await
+        .context("write challenge metric")?;
+    locked.flush().await.context("flush challenge metric")?;
+    Ok(())
 }
 
 async fn wait_for_api_slot(api_slot: &Arc<Mutex<Instant>>, spacing: Duration) -> Duration {
@@ -546,6 +607,7 @@ async fn process_game(
     sem: Arc<tokio::sync::Semaphore>,
     api_slot: Arc<Mutex<Instant>>,
     api_lane: Arc<Mutex<()>>,
+    metrics_writer: Arc<Mutex<tokio::fs::File>>,
     use_api_lane: bool,
     api_spacing: Duration,
     poll_interval: Duration,
@@ -603,6 +665,19 @@ async fn process_game(
         "[game:{game_id}] solve diff={difficulty} took {}ms (nonce={nonce})",
         pow_elapsed_ms
     );
+    if let Err(e) = append_challenge_metric(
+        &metrics_writer,
+        &game_id,
+        difficulty,
+        pow_elapsed_ms,
+        &nonce,
+    )
+    .await
+    {
+        eprintln!("[game:{game_id}] metrics export failed: {e:#}");
+    } else {
+        eprintln!("[game:{game_id}] metrics exported (diff={difficulty}, pow_ms={pow_elapsed_ms})");
+    }
 
     // Step 3: submit
     let submit_url = format!("{BASE_URL}/api/analysis");
@@ -752,6 +827,11 @@ async fn main() -> Result<()> {
         .index_cache
         .clone()
         .unwrap_or_else(|| args.output.join("_cache").join("games_index.json"));
+    let challenge_metrics_path = args
+        .challenge_metrics_csv
+        .clone()
+        .unwrap_or_else(|| args.output.join("_metrics").join("challenge_times.csv"));
+    let metrics_writer = init_challenge_metrics_writer(&challenge_metrics_path).await?;
 
     let game_index = load_or_fetch_game_index(
         client.as_ref(),
@@ -775,13 +855,14 @@ async fn main() -> Result<()> {
     };
 
     println!(
-        "concurrency: {concurrency} | chunk-size: {} | instance: {}/{} | api-spacing: {} | poll: {}s | index: {}",
+        "concurrency: {concurrency} | chunk-size: {} | instance: {}/{} | api-spacing: {} | poll: {}s | index: {} | metrics: {}",
         chunk_size_display,
         args.offset + 1,
         args.total_instances,
         api_spacing_display,
         args.poll_interval_secs,
-        index_cache_path.display()
+        index_cache_path.display(),
+        challenge_metrics_path.display()
     );
 
     if args.disable_api_spacing {
@@ -853,6 +934,7 @@ async fn main() -> Result<()> {
                     let sem = sem.clone();
                     let api_slot = api_slot.clone();
                     let api_lane = api_lane.clone();
+                    let metrics_writer = metrics_writer.clone();
                     let skip = args.skip_existing;
                     tokio::spawn(async move {
                         if let Err(e) = process_game(
@@ -861,6 +943,7 @@ async fn main() -> Result<()> {
                             sem,
                             api_slot,
                             api_lane,
+                            metrics_writer,
                             false,
                             api_spacing,
                             poll_interval,
@@ -895,6 +978,7 @@ async fn main() -> Result<()> {
                 sem.clone(),
                 api_slot.clone(),
                 api_lane.clone(),
+                metrics_writer.clone(),
                 true,
                 api_spacing,
                 poll_interval,
