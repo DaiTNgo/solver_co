@@ -1,4 +1,9 @@
-use std::{path::PathBuf, sync::Arc, thread::available_parallelism, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread::available_parallelism,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -28,6 +33,18 @@ struct Args {
     /// Skip games whose output file already exists
     #[arg(short, long, default_value_t = true)]
     skip_existing: bool,
+
+    /// Rebuild game index cache from API instead of using local JSON
+    #[arg(long, default_value_t = false)]
+    refresh_index: bool,
+
+    /// Path to cached game index JSON (default: <output>/_cache/games_index.json)
+    #[arg(long)]
+    index_cache: Option<PathBuf>,
+
+    /// Only fetch/cache tournaments-editions-games index, skip analysis requests
+    #[arg(long, default_value_t = false)]
+    index_only: bool,
 
     /// Instance offset for sharding (0-based)
     #[arg(long, default_value_t = 0)]
@@ -64,6 +81,20 @@ struct GamesResponse {
 #[derive(Deserialize)]
 struct Game {
     slug: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CachedGame {
+    key: String,
+    year: String,
+    game_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GameIndexCache {
+    base_url: String,
+    generated_unix: u64,
+    games: Vec<CachedGame>,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +199,152 @@ async fn poll_job(client: &Client, job_id: &str) -> Result<Option<Value>> {
     }
 }
 
+// ─── Metadata index (cache tournaments/editions/games) ──────────────
+
+async fn fetch_game_index(client: &Client) -> Result<Vec<CachedGame>> {
+    // 1) Fetch all tournament keys
+    let tournaments: Vec<Tournament> = client
+        .get(format!("{BASE_URL}/api/tournaments"))
+        .send()
+        .await
+        .context("fetch /tournaments")?
+        .json()
+        .await
+        .context("parse tournaments")?;
+
+    // 2) Fetch editions for each tournament key concurrently
+    let edition_futs = tournaments.into_iter().map(|t| {
+        let client = client.clone();
+        async move {
+            let resp = client
+                .get(format!("{BASE_URL}/api/tournaments/{}", t.key))
+                .send()
+                .await?;
+            let status = resp.status();
+            let bytes = resp.bytes().await?;
+            if !status.is_success() {
+                anyhow::bail!("HTTP {status}: {}", String::from_utf8_lossy(&bytes));
+            }
+            let detail: TournamentDetail = serde_json::from_slice(&bytes)?;
+            Ok::<_, anyhow::Error>((t.key, detail.editions))
+        }
+    });
+    let keys_editions: Vec<(String, Vec<Edition>)> = join_all(edition_futs)
+        .await
+        .into_iter()
+        .filter_map(|r| r.map_err(|e| eprintln!("[editions] {e:#}")).ok())
+        .collect();
+
+    // 3) Fetch game lists for all key/year combos concurrently
+    let game_futs = keys_editions
+        .into_iter()
+        .flat_map(|(key, editions)| {
+            editions.into_iter().map(move |e| {
+                let year = match &e.year {
+                    Value::Number(n) => n.to_string(),
+                    Value::String(s) => s.clone(),
+                    v => v.to_string(),
+                };
+                (key.clone(), year)
+            })
+        })
+        .map(|(key, year)| {
+            let client = client.clone();
+            async move {
+                let url = format!("{BASE_URL}/api/tournaments/{key}/{year}");
+                let resp = client.get(&url).send().await?;
+                let status = resp.status();
+                let bytes = resp.bytes().await?;
+                if !status.is_success() {
+                    anyhow::bail!(
+                        "[{key}/{year}] HTTP {status}: {}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+                let resp: GamesResponse = serde_json::from_slice(&bytes)?;
+                Ok::<_, anyhow::Error>((key, year, resp.games))
+            }
+        });
+    let all_games: Vec<(String, String, Vec<Game>)> = join_all(game_futs)
+        .await
+        .into_iter()
+        .filter_map(|r| r.map_err(|e| eprintln!("[games] {e:#}")).ok())
+        .collect();
+
+    Ok(all_games
+        .into_iter()
+        .flat_map(|(key, year, games)| {
+            games.into_iter().map(move |g| CachedGame {
+                key: key.clone(),
+                year: year.clone(),
+                game_id: g.slug,
+            })
+        })
+        .collect())
+}
+
+async fn load_or_fetch_game_index(
+    client: &Client,
+    cache_path: &Path,
+    refresh: bool,
+) -> Result<Vec<CachedGame>> {
+    if !refresh && cache_path.exists() {
+        match tokio::fs::read(cache_path).await {
+            Ok(bytes) => match serde_json::from_slice::<GameIndexCache>(&bytes) {
+                Ok(cache) => {
+                    println!(
+                        "using cached index: {} games ({})",
+                        cache.games.len(),
+                        cache_path.display()
+                    );
+                    return Ok(cache.games);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[cache] parse failed ({}), refetching: {e:#}",
+                        cache_path.display()
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[cache] read failed ({}), refetching: {e:#}",
+                    cache_path.display()
+                );
+            }
+        }
+    }
+
+    let games = fetch_game_index(client).await?;
+
+    if let Some(parent) = cache_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("create cache dir")?;
+    }
+
+    let generated_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = GameIndexCache {
+        base_url: BASE_URL.to_string(),
+        generated_unix,
+        games: games.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&payload).context("serialize game index cache")?;
+    tokio::fs::write(cache_path, &bytes)
+        .await
+        .context("write game index cache")?;
+
+    println!(
+        "saved fresh index: {} games ({})",
+        games.len(),
+        cache_path.display()
+    );
+    Ok(games)
+}
+
 // ─── Per-game pipeline ───────────────────────────────────────────────
 
 async fn process_game(
@@ -205,7 +382,10 @@ async fn process_game(
         let status = resp.status();
         let bytes = resp.bytes().await.context("fetch challenge body")?;
         if !status.is_success() {
-            anyhow::bail!("challenge HTTP {status}: {}", String::from_utf8_lossy(&bytes));
+            anyhow::bail!(
+                "challenge HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
         }
         serde_json::from_slice::<ChallengeResponse>(&bytes).context("parse challenge")?
     };
@@ -233,8 +413,7 @@ async fn process_game(
     if !status.is_success() {
         anyhow::bail!("submit HTTP {status}: {}", String::from_utf8_lossy(&bytes));
     }
-    let submit: SubmitResponse =
-        serde_json::from_slice(&bytes).context("parse submit response")?;
+    let submit: SubmitResponse = serde_json::from_slice(&bytes).context("parse submit response")?;
 
     // Step 4: resolve result — immediate or via job polling
     let result = if submit.status.as_deref() == Some("done") {
@@ -273,6 +452,12 @@ async fn process_game(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    anyhow::ensure!(args.total_instances > 0, "--total-instances must be >= 1");
+    anyhow::ensure!(
+        args.offset < args.total_instances,
+        "--offset must be < --total-instances"
+    );
+
     let concurrency = args
         .concurrency
         .unwrap_or_else(|| available_parallelism().map(|n| n.get()).unwrap_or(4));
@@ -293,95 +478,65 @@ async fn main() -> Result<()> {
     // Slot-based rate limiter: space challenge requests 1100ms apart (≈55/min)
     let challenge_slot = Arc::new(Mutex::new(Instant::now()));
 
-    // 1. Fetch all tournament keys
-    let tournaments: Vec<Tournament> = client
-        .get(format!("{BASE_URL}/api/tournaments"))
-        .send()
-        .await
-        .context("fetch /tournaments")?
-        .json()
-        .await
-        .context("parse tournaments")?;
+    let index_cache_path = args
+        .index_cache
+        .clone()
+        .unwrap_or_else(|| args.output.join("_cache").join("games_index.json"));
 
-    // 2. Fetch editions for each tournament key concurrently
-    let edition_futs = tournaments.into_iter().map(|t| {
-        let client = client.clone();
-        async move {
-            let resp = client
-                .get(format!("{BASE_URL}/api/tournaments/{}", t.key))
-                .send()
-                .await?;
-            let status = resp.status();
-            let bytes = resp.bytes().await?;
-            if !status.is_success() {
-                anyhow::bail!("HTTP {status}: {}", String::from_utf8_lossy(&bytes));
-            }
-            let detail: TournamentDetail = serde_json::from_slice(&bytes)?;
-            Ok::<_, anyhow::Error>((t.key, detail.editions))
-        }
-    });
-    let keys_editions: Vec<(String, Vec<Edition>)> = join_all(edition_futs)
-        .await
-        .into_iter()
-        .filter_map(|r| r.map_err(|e| eprintln!("[editions] {e:#}")).ok())
-        .collect();
+    let game_index =
+        load_or_fetch_game_index(client.as_ref(), &index_cache_path, args.refresh_index).await?;
 
-    // 3. Fetch game lists for all key/year combos concurrently
-    let game_futs = keys_editions
-        .into_iter()
-        .flat_map(|(key, editions)| {
-            editions.into_iter().map(move |e| {
-                let year = match &e.year {
-                    Value::Number(n) => n.to_string(),
-                    Value::String(s) => s.clone(),
-                    v => v.to_string(),
-                };
-                (key.clone(), year)
-            })
-        })
-        .map(|(key, year)| {
-            let client = client.clone();
-            async move {
-                let url = format!("{BASE_URL}/api/tournaments/{key}/{year}");
-                let resp = client.get(&url).send().await?;
-                let status = resp.status();
-                let bytes = resp.bytes().await?;
-                if !status.is_success() {
-                    anyhow::bail!("[{key}/{year}] HTTP {status}: {}", String::from_utf8_lossy(&bytes));
-                }
-                let resp: GamesResponse = serde_json::from_slice(&bytes)?;
-                Ok::<_, anyhow::Error>((key, year, resp.games))
-            }
-        });
-    let all_games: Vec<(String, String, Vec<Game>)> = join_all(game_futs)
-        .await
-        .into_iter()
-        .filter_map(|r| {
-            r.map_err(|e| eprintln!("[games] {e:#}")).ok()
-        })
-        .collect();
+    println!(
+        "concurrency: {concurrency} | instance: {}/{} | index: {}",
+        args.offset + 1,
+        args.total_instances,
+        index_cache_path.display()
+    );
 
-    println!("concurrency: {concurrency} | instance: {}/{}", args.offset + 1, args.total_instances);
+    if args.index_only {
+        println!(
+            "index-only: cached {} games, no analysis/challenge requests sent",
+            game_index.len()
+        );
+        return Ok(());
+    }
 
-    // 4. Process all games with bounded concurrency (semaphore)
-    let tasks: Vec<_> = all_games
+    // 4. Select this shard and skip files that already exist before any challenge call
+    let mut skipped_existing_count = 0usize;
+    let total_games = game_index.len();
+    let queued_games: Vec<(String, PathBuf)> = game_index
         .into_iter()
-        .flat_map(|(key, year, games)| {
-            games
-                .into_iter()
-                .map(move |g| (key.clone(), year.clone(), g.slug))
-        })
         .enumerate()
         .filter(|(i, _)| i % args.total_instances == args.offset)
-        .map(|(_, (key, year, game_id))| {
+        .filter_map(|(_, g)| {
+            let out = args
+                .output
+                .join(&g.key)
+                .join(&g.year)
+                .join(format!("{}.json", g.game_id));
+
+            if args.skip_existing && out.exists() {
+                skipped_existing_count += 1;
+                None
+            } else {
+                Some((g.game_id, out))
+            }
+        })
+        .collect();
+
+    println!(
+        "indexed: {total_games} | queued: {} | skipped-existing: {}",
+        queued_games.len(),
+        skipped_existing_count
+    );
+
+    // 5. Process queued games with bounded concurrency (semaphore)
+    let tasks: Vec<_> = queued_games
+        .into_iter()
+        .map(|(game_id, out)| {
             let client = client.clone();
             let sem = sem.clone();
             let challenge_slot = challenge_slot.clone();
-            let out = args
-                .output
-                .join(&key)
-                .join(&year)
-                .join(format!("{game_id}.json"));
             let skip = args.skip_existing;
             tokio::spawn(async move {
                 if let Err(e) =
